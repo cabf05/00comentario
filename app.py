@@ -11,6 +11,9 @@ import streamlit as st
 APIFY_RUN_SYNC_ENDPOINT = (
     "https://api.apify.com/v2/acts/compass~crawler-google-places/run-sync-get-dataset-items"
 )
+APIFY_RUN_ASYNC_ENDPOINT = "https://api.apify.com/v2/acts/compass~crawler-google-places/runs"
+APIFY_RUN_STATUS_ENDPOINT = "https://api.apify.com/v2/actor-runs/{run_id}"
+APIFY_DATASET_ITEMS_ENDPOINT = "https://api.apify.com/v2/datasets/{dataset_id}/items"
 
 FINAL_REVIEW_FIELDS = [
     "title",
@@ -89,6 +92,98 @@ def build_actor_input(
     }
 
 
+def _extract_apify_error_detail(response: requests.Response) -> Any:
+    try:
+        return response.json()
+    except Exception:
+        return response.text
+
+
+def _extract_items_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return payload
+
+    if isinstance(payload, dict):
+        for key in ("items", "data", "datasetItems", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+
+    raise RuntimeError(f"Unexpected response shape from Apify: {type(payload).__name__}")
+
+
+def _is_sync_timeout_error(response: requests.Response, detail: Any) -> bool:
+    if response.status_code != 408:
+        return False
+    if not isinstance(detail, dict):
+        return False
+    error = detail.get("error")
+    return isinstance(error, dict) and error.get("type") == "run-timeout-exceeded"
+
+
+def _poll_apify_run_and_fetch_items(
+    headers: Dict[str, str],
+    actor_input: Dict[str, Any],
+    poll_wait_seconds: int = 20,
+    max_poll_attempts: int = 45,
+) -> List[Dict[str, Any]]:
+    run_response = requests.post(
+        APIFY_RUN_ASYNC_ENDPOINT,
+        headers=headers,
+        params={"memory": 4096},
+        data=json.dumps(actor_input),
+        timeout=60,
+    )
+
+    if not run_response.ok:
+        detail = _extract_apify_error_detail(run_response)
+        raise RuntimeError(f"Apify API error ({run_response.status_code}): {detail}")
+
+    run_payload = run_response.json()
+    run_data = _as_dict(run_payload.get("data"))
+    run_id = run_data.get("id")
+    default_dataset_id = run_data.get("defaultDatasetId")
+    if not run_id:
+        raise RuntimeError("Apify não retornou o run_id ao iniciar a execução assíncrona.")
+
+    for _ in range(max_poll_attempts):
+        status_response = requests.get(
+            APIFY_RUN_STATUS_ENDPOINT.format(run_id=run_id),
+            headers=headers,
+            params={"waitForFinish": poll_wait_seconds},
+            timeout=poll_wait_seconds + 30,
+        )
+        if not status_response.ok:
+            detail = _extract_apify_error_detail(status_response)
+            raise RuntimeError(f"Apify API error ({status_response.status_code}): {detail}")
+
+        status_payload = status_response.json()
+        status_data = _as_dict(status_payload.get("data"))
+        status = status_data.get("status")
+        default_dataset_id = status_data.get("defaultDatasetId") or default_dataset_id
+
+        if status == "SUCCEEDED":
+            if not default_dataset_id:
+                raise RuntimeError("Execução concluída, mas o dataset não foi retornado pelo Apify.")
+
+            items_response = requests.get(
+                APIFY_DATASET_ITEMS_ENDPOINT.format(dataset_id=default_dataset_id),
+                headers=headers,
+                params={"clean": "true", "format": "json"},
+                timeout=120,
+            )
+            if not items_response.ok:
+                detail = _extract_apify_error_detail(items_response)
+                raise RuntimeError(f"Apify API error ({items_response.status_code}): {detail}")
+            return _extract_items_from_payload(items_response.json())
+
+        if status in {"FAILED", "ABORTED", "TIMED-OUT"}:
+            status_message = status_data.get("statusMessage") or "sem detalhes"
+            raise RuntimeError(f"Execução do actor terminou com status {status}: {status_message}")
+
+    raise RuntimeError("Tempo limite excedido aguardando a execução assíncrona do actor no Apify.")
+
+
 def run_apify_actor(api_token: str, actor_input: Dict[str, Any]) -> List[Dict[str, Any]]:
     headers = {
         "Authorization": f"Bearer {api_token.strip()}",
@@ -106,10 +201,9 @@ def run_apify_actor(api_token: str, actor_input: Dict[str, Any]) -> List[Dict[st
     )
 
     if not response.ok:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
+        detail = _extract_apify_error_detail(response)
+        if _is_sync_timeout_error(response, detail):
+            return _poll_apify_run_and_fetch_items(headers=headers, actor_input=actor_input)
         raise RuntimeError(f"Apify API error ({response.status_code}): {detail}")
 
     try:
@@ -117,16 +211,7 @@ def run_apify_actor(api_token: str, actor_input: Dict[str, Any]) -> List[Dict[st
     except Exception as exc:
         raise RuntimeError(f"Unable to parse Apify response as JSON: {exc}")
 
-    if isinstance(payload, list):
-        return payload
-
-    if isinstance(payload, dict):
-        for key in ("items", "data", "datasetItems", "results"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-
-    raise RuntimeError(f"Unexpected response shape from Apify: {type(payload).__name__}")
+    return _extract_items_from_payload(payload)
 
 
 def _as_list(value: Any) -> List[Any]:
