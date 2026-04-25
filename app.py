@@ -2,7 +2,8 @@ import json
 import re
 import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from numbers import Number
+from typing import Any, Dict, List, Tuple
 
 import requests
 import streamlit as st
@@ -42,6 +43,53 @@ FINAL_REVIEW_FIELDS = [
     "originalLanguage",
     "translatedLanguage",
 ]
+
+REQUIRED_NON_NULL_FIELDS = ["reviewId", "name", "stars", "publishAt", "publishedAtDate"]
+
+MARKETING_PATTERNS = [
+    r"\bbook now\b",
+    r"\bschedule (a )?tour\b",
+    r"\bluxury living\b",
+    r"\bcontact us\b",
+    r"\bcall now\b",
+    r"\blimited time\b",
+    r"\bamenit(?:y|ies)\b",
+    r"\bfloor plan\b",
+    r"\bstarting at\b",
+    r"\bunidades? dispon[íi]veis\b",
+    r"\bagende (sua )?visita\b",
+    r"\bfale conosco\b",
+    r"\blocaliza[çc][aã]o privilegiada\b",
+    r"\binfraestrutura completa\b",
+]
+
+FIELD_TYPE_RULES: Dict[str, Tuple[type, ...]] = {
+    "title": (str, type(None)),
+    "reviewerId": (str, type(None)),
+    "reviewerUrl": (str, type(None)),
+    "name": (str,),
+    "reviewerNumberOfReviews": (int, float, type(None)),
+    "isLocalGuide": (bool, type(None)),
+    "reviewerPhotoUrl": (str, type(None)),
+    "text": (str, type(None)),
+    "textTranslated": (str, type(None)),
+    "publishAt": (str,),
+    "publishedAtDate": (str,),
+    "likesCount": (int, float, type(None)),
+    "reviewId": (str,),
+    "reviewUrl": (str, type(None)),
+    "reviewOrigin": (str, type(None)),
+    "stars": (int, float),
+    "rating": (int, float, type(None)),
+    "responseFromOwnerDate": (str, type(None)),
+    "responseFromOwnerText": (str, type(None)),
+    "reviewImageUrls": (list,),
+    "reviewContext": (dict,),
+    "reviewDetailedRating": (dict,),
+    "visitedIn": (str, type(None)),
+    "originalLanguage": (str, type(None)),
+    "translatedLanguage": (str, type(None)),
+}
 
 
 def build_actor_input(
@@ -278,6 +326,18 @@ def _normalize_review_record(raw_review: Dict[str, Any], place_title: str | None
     return {k: normalized[k] for k in FINAL_REVIEW_FIELDS}
 
 
+def _looks_like_google_review_source(candidate: Dict[str, Any]) -> bool:
+    required_for_source = ["reviewId", "name", "stars", "publishAt", "publishedAtDate"]
+    for field in required_for_source:
+        value = candidate.get(field)
+        if value is None:
+            return False
+        if isinstance(value, str) and not value.strip():
+            return False
+    stars = candidate.get("stars")
+    return isinstance(stars, Number) and not isinstance(stars, bool)
+
+
 def _extract_reviews_from_node(node: Any, inherited_title: str | None = None) -> List[Dict[str, Any]]:
     reviews: List[Dict[str, Any]] = []
 
@@ -295,21 +355,11 @@ def _extract_reviews_from_node(node: Any, inherited_title: str | None = None) ->
     if isinstance(nested_reviews, list):
         for item in nested_reviews:
             if isinstance(item, dict):
-                reviews.append(_normalize_review_record(item, place_title=current_title))
+                normalized = _normalize_review_record(item, place_title=current_title)
+                if _looks_like_google_review_source(normalized):
+                    reviews.append(normalized)
 
-    has_review_shape = any(
-        key in node
-        for key in (
-            "reviewId",
-            "reviewUrl",
-            "reviewerId",
-            "reviewerUrl",
-            "stars",
-            "text",
-            "publishedAtDate",
-        )
-    )
-    if has_review_shape:
+    if _looks_like_google_review_source(node):
         reviews.append(_normalize_review_record(node, place_title=inherited_title))
 
     for value in node.values():
@@ -317,6 +367,50 @@ def _extract_reviews_from_node(node: Any, inherited_title: str | None = None) ->
             reviews.extend(_extract_reviews_from_node(value, current_title))
 
     return reviews
+
+
+def _has_promotional_pattern(review: Dict[str, Any]) -> bool:
+    text_parts = [review.get("title"), review.get("text"), review.get("textTranslated")]
+    haystack = " ".join(part for part in text_parts if isinstance(part, str)).lower()
+    if not haystack.strip():
+        return False
+    return any(re.search(pattern, haystack, flags=re.IGNORECASE) for pattern in MARKETING_PATTERNS)
+
+
+def _is_schema_compatible(review: Dict[str, Any]) -> bool:
+    if set(review.keys()) != set(FINAL_REVIEW_FIELDS):
+        return False
+
+    for field, expected_types in FIELD_TYPE_RULES.items():
+        value = review.get(field)
+        if not isinstance(value, expected_types):
+            return False
+        if isinstance(value, bool) and field in {"stars", "rating", "likesCount", "reviewerNumberOfReviews"}:
+            return False
+
+    for field in REQUIRED_NON_NULL_FIELDS:
+        value = review.get(field)
+        if value is None:
+            return False
+        if isinstance(value, str) and not value.strip():
+            return False
+
+    if _has_promotional_pattern(review):
+        return False
+
+    review_origin = review.get("reviewOrigin")
+    if isinstance(review_origin, str) and review_origin.strip() and "google" not in review_origin.lower():
+        return False
+
+    return True
+
+
+def filter_valid_google_reviews(reviews: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    valid_reviews: List[Dict[str, Any]] = []
+    for review in reviews:
+        if _is_schema_compatible(review):
+            valid_reviews.append(review)
+    return valid_reviews
 
 
 def normalize_reviews_to_apify_format(raw_payload: Any) -> List[Dict[str, Any]]:
@@ -459,15 +553,20 @@ def main() -> None:
             try:
                 raw_items = run_apify_actor(api_token, actor_input)
                 normalized_reviews = normalize_reviews_to_apify_format(raw_items)
+                valid_reviews = filter_valid_google_reviews(normalized_reviews)
             except Exception as exc:
                 st.error(str(exc))
                 st.stop()
 
-        place_name = (normalized_reviews[0].get("title") if normalized_reviews else None) or "local"
-        export_filename = generate_export_filename(place_name)
-        json_text = json.dumps(normalized_reviews, ensure_ascii=False, indent=2)
+        dropped_count = len(normalized_reviews) - len(valid_reviews)
+        if dropped_count > 0:
+            st.warning(f"{dropped_count} item(ns) inválido(s) ou suspeito(s) foram descartados antes da exportação.")
 
-        st.success(f"Concluído. {len(normalized_reviews)} review(s) normalizada(s) em lista flat.")
+        place_name = (valid_reviews[0].get("title") if valid_reviews else None) or "local"
+        export_filename = generate_export_filename(place_name)
+        json_text = json.dumps(valid_reviews, ensure_ascii=False, indent=2)
+
+        st.success(f"Concluído. {len(valid_reviews)} review(s) válida(s) exportada(s) em lista flat.")
 
         st.download_button(
             label="Baixar JSON final (flat)",
@@ -477,7 +576,7 @@ def main() -> None:
         )
 
         st.subheader("Preview do JSON final")
-        st.json(normalized_reviews[:3])
+        st.json(valid_reviews[:3])
 
         st.subheader("JSON final")
         st.code(json_text, language="json")
